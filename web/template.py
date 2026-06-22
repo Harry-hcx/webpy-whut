@@ -1,6 +1,15 @@
 """
-simple, elegant templating
+simple, elegant templating（简洁优雅的模板引擎）
 (part of web.py)
+
+【功能层】实现一套以 $ 符号为标记的 Python 内嵌模板语言，支持表达式插值、
+         for/if/while 等控制流、模板继承（$var）、模板函数等特性。
+【设计层】经典的"编译型模板"架构：模板文本 → 词法分析 → AST 节点树 → Python 代码生成
+         → exec 执行。每个 AST 节点实现 emit() 方法生成对应 Python 代码，
+         是"访问者模式"（Visitor Pattern）的变体。
+         使用 ast 模块进行安全性校验（safeeval），防止模板执行任意危险代码。
+【上下文层】web.template.render('templates/') 是用户代码获取渲染器的入口，
+         Template 类负责编译单个模板，Render/render/frender 提供目录级模板管理。
 
 Template design:
 
@@ -77,7 +86,16 @@ def splitline(text):
 
 
 class Parser:
-    """Parser Base."""
+    """
+    【功能层】模板解析器基类：将模板文本逐行解析为 AST 节点列表（parse tree）。
+    【设计层】采用递归下降解析（Recursive Descent Parsing）策略：
+             parse() → read_defwith() + read_suite() → read_section()* →
+             read_block_section() / read_assignment() / readline()。
+             每个 read_* 方法消费输入文本的一部分，返回 (节点, 剩余文本) 二元组，
+             是函数式解析器组合子（Parser Combinator）风格的简化实现。
+    【上下文层】Template 类实例化后调用 Parser.parse() 得到 DefwithNode 根节点，
+             再由根节点的 emit() 方法生成 Python 代码字符串。
+    """
 
     def __init__(self):
         self.statement_nodes = STATEMENT_NODES
@@ -863,6 +881,15 @@ class ForLoopContext:
 
 
 class BaseTemplate:
+    """
+    【功能层】模板基类：持有编译后的模板函数，并提供执行环境的构建逻辑。
+    【设计层】_compile() 将生成的 Python 代码字符串通过 exec() 执行到隔离的 env 字典中，
+             提取其中的 __template__ 函数保存为 self.t；
+             调用模板时直接调用 self.t(*args)，实现"编译一次，多次调用"的性能优化。
+             make_env() 构造沙箱环境，只暴露安全的内置函数（TEMPLATE_BUILTINS），
+             防止模板执行危险操作（如 import os、open 等）。
+    【上下文层】Template 继承此类，用于单文件模板；Render 类管理目录级模板集合。
+    """
     def __init__(self, code, filename, filter, globals, builtins):
         self.filename = filename
         self.filter = filter
@@ -918,6 +945,16 @@ class BaseTemplate:
 
 
 class Template(BaseTemplate):
+    """
+    【功能层】web.py 模板类：将模板文本编译为可调用的 Python 函数，
+             支持 HTML/XHTML/TXT 等格式，自动根据文件扩展名选择 XSS 过滤器和 Content-Type。
+    【设计层】compile_template() 完成"文本→Python代码"的完整编译过程：
+             Parser 解析 → AST节点树 → emit() 代码生成 → safecheck 安全校验。
+             静态方法 normalize_text 统一处理 \r\n、tab 等格式差异，
+             保证模板在不同操作系统上行为一致。
+    【上下文层】Render 类在加载模板目录时批量实例化 Template，
+             也可单独使用：`t = Template(open('index.html').read()); t(name='world')`。
+    """
     CONTENT_TYPES = {
         ".html": "text/html; charset=utf-8",
         ".xhtml": "application/xhtml+xml; charset=utf-8",
@@ -1048,7 +1085,18 @@ class CompiledTemplate(Template):
 
 
 class Render:
-    """The most preferred way of using templates.
+    """
+    【功能层】模板目录渲染器：管理一个目录下的所有模板文件，
+             通过属性访问加载对应模板，支持基础布局（base template）包裹。
+    【设计层】利用 __getattr__ 实现动态属性访问：`render.index` 自动在目录中
+             查找 index.html/index.txt 等文件并编译为 Template 实例，
+             是 Python 属性协议的巧妙应用，避免了显式注册模板的样板代码。
+             cache 参数（debug 模式下关闭缓存）实现开发/生产双模式：
+             开发时每次重新读取文件，生产时缓存编译结果提高性能。
+    【上下文层】用户代码中 `render = web.template.render('templates/')`
+             然后 `return render.index(name='world')` 即可渲染模板。
+
+    The most preferred way of using templates.
 
         render = web.template.render('templates')
         print render.foo()
@@ -1434,7 +1482,17 @@ class SafeVisitor(ast.NodeVisitor):
 
 
 class TemplateResult(MutableMapping):
-    """Dictionary like object for storing template output.
+    """
+    【功能层】模板执行结果容器：既是字符串（响应体 __body__），也是字典（$var 定义的变量）。
+    【设计层】继承 MutableMapping 抽象基类，实现完整的字典接口，
+             同时重载 __str__/__unicode__ 返回 __body__ 内容，
+             使模板结果在字符串上下文中自动转为 HTML 字符串。
+             这种"多重身份"的设计（dict + str）是"鸭子类型"与 ABC 的结合应用，
+             使模板结果可以无缝传递给 base template 做二次渲染（布局模板）。
+    【上下文层】每次调用 Template 实例都返回一个 TemplateResult；
+             base template 接收此对象，通过 $var body 获取内容进行包裹。
+
+    Dictionary like object for storing template output.
 
     The result of a template execution is usually a string, but sometimes it
     contains attributes set using $var. This class provides a simple

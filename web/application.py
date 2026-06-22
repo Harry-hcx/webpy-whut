@@ -1,6 +1,14 @@
 """
-Web application
+Web application（Web 应用核心）
 (from web.py)
+
+【功能层】实现 WSGI 应用对象，负责 URL 路由分发、请求处理管道（processor 链）、
+         自动热重载、子应用挂载、子域名路由等核心功能。
+【设计层】以"处理器链"（processor chain）模式组织中间件，每个 processor 是一个
+         接受 handler 函数并返回响应的高阶函数，形成递归调用链（类似洋葱模型）。
+         使用闭包和高阶函数大量替代继承，体现函数式风格。
+【上下文层】用户代码的入口：`app = web.application(urls, globals())`，
+         所有请求最终都经由此模块的 wsgifunc 处理。
 """
 
 import itertools
@@ -32,6 +40,14 @@ __all__ = [
 
 class application:
     """
+    【功能层】web.py 的核心应用类，将 URL 模式列表（mapping）映射到处理器类，
+             并提供完整的 WSGI 接口、请求测试、热重载、处理器管道等能力。
+    【设计层】不继承任何基类（old-style 命名风格保持历史兼容）；
+             通过 add_processor 构建处理器链，每个 processor 包裹 handler 形成
+             类似"洋葱"的调用结构——这是 web.py 的中间件机制，比显式继承更灵活。
+    【上下文层】用户代码 `app = application(urls, globals())` 后，
+             可调用 app.run() 启动服务器，或将 app.wsgifunc() 挂载到任意 WSGI 容器。
+
     Application to delegate requests based on path.
 
         >>> urls = ("/hello", "hello")
@@ -46,12 +62,15 @@ class application:
     # PY3DOCTEST: b'hello'
 
     def __init__(self, mapping=(), fvars={}, autoreload=None):
+        # 【功能层】初始化应用：设置路由表、变量作用域、处理器链、热重载
         if autoreload is None:
-            autoreload = web.config.get("debug", False)
-        self.init_mapping(mapping)
-        self.fvars = fvars
-        self.processors = []
+            autoreload = web.config.get("debug", False)  # debug 模式默认开启热重载
+        self.init_mapping(mapping)   # 将平铺元组路由表转为 [(pattern, handler), ...] 列表
+        self.fvars = fvars           # 保存调用方的全局变量字典，用于按字符串名查找处理器类
+        self.processors = []         # 处理器链（中间件列表），按注册顺序执行
 
+        # 【设计层】loadhook/unloadhook 将普通函数包装成符合处理器协议的函数，
+        #          _load/_unload 维护 app_stack（子应用栈），实现应用嵌套
         self.add_processor(loadhook(self._load))
         self.add_processor(unloadhook(self._unload))
 
@@ -267,30 +286,47 @@ class application:
         return self._delegate(fn, self.fvars, args)
 
     def handle_with_processors(self):
+        # 【功能层】将请求依次通过所有处理器（中间件），最终调用 handle() 分发路由
         def process(processors):
             try:
                 if processors:
+                    # 【设计层】递归地将处理器列表"折叠"为嵌套调用：
+                    #          p1(lambda: p2(lambda: p3(lambda: handle())))
+                    #          外层 processor 先执行，形成"洋葱"调用顺序
                     p, processors = processors[0], processors[1:]
                     return p(lambda: process(processors))
                 else:
-                    return self.handle()
+                    return self.handle()   # 链尾：执行真正的路由分发
             except web.HTTPError:
-                raise
+                raise   # HTTP 异常直接向上传播，由 wsgifunc 捕获转换为响应
             except (KeyboardInterrupt, SystemExit):
-                raise
+                raise   # 系统级信号不吞掉
             except:
                 print(traceback.format_exc(), file=web.debug)
-                raise self.internalerror()
+                raise self.internalerror()   # 其他异常转为 500
 
-        # processors must be applied in the reverse order. (??)
+        # 【设计层】处理器按注册顺序排列，但调用时需要"从后往前"包裹，
+        #          因此传入完整列表由递归实现正确的包裹顺序
         return process(self.processors)
 
     def wsgifunc(self, *middleware):
-        """Returns a WSGI-compatible function for this application."""
+        """
+        【功能层】将 application 转换为标准 WSGI 可调用对象，
+                 可选包裹额外的 WSGI 中间件。
+        【设计层】内部定义 wsgi(env, start_resp) 闭包，捕获 self；
+                 build_result 生成器统一处理 str/bytes 响应体；
+                 cleanup() 生成器挂在 itertools.chain 末尾，
+                 保证响应体全部发送后再清理线程状态（惰性求值保证顺序）。
+        【上下文层】app.run() 和 app.cgirun() 都调用此方法获取 WSGI callable。
+        """
 
         def peep(iterator):
-            """Peeps into an iterator by doing an iteration
-            and returns an equivalent iterator.
+            """
+            【功能层】"窥探"迭代器：提前消费第一个元素，触发 handle() 的实际执行，
+                     确保响应头（status/headers）在 start_response 调用前已被设置。
+            【设计层】WSGI 规范要求 start_response 在第一次 yield 数据前调用；
+                     使用 itertools.chain 将首元素与剩余迭代器重新拼接，
+                     调用方无感知地得到完整响应。
             """
             # wsgi requires the headers first
             # so we need to do an iteration
@@ -303,24 +339,27 @@ class application:
             return itertools.chain([firstchunk], iterator)
 
         def wsgi(env, start_resp):
-            # clear threadlocal to avoid interference of previous requests
-            self._cleanup()
+            # 【功能层】标准 WSGI 入口：清理线程状态 -> 初始化 ctx -> 处理请求 -> 返回响应体迭代器
+            self._cleanup()    # 清除上一请求可能残留的线程本地数据
 
-            self.load(env)
+            self.load(env)     # 用 WSGI environ 初始化 web.ctx
             try:
-                # allow uppercase methods only
+                # 【设计层】只接受全大写 HTTP 方法，防止大小写混用导致的安全或路由问题
                 if web.ctx.method.upper() != web.ctx.method:
                     raise web.nomethod()
 
                 result = self.handle_with_processors()
+                # 【设计层】检查结果是否为生成器（__next__ 方法），
+                #          生成器响应需要先 peep 触发首次迭代以设置响应头
                 if result and hasattr(result, "__next__"):
                     result = peep(result)
                 else:
                     result = [result]
             except web.HTTPError as e:
-                result = [e.data]
+                result = [e.data]   # HTTP 异常的 data 就是响应体
 
             def build_result(result):
+                # 【功能层】统一将响应体转为 bytes，WSGI 要求响应体必须是 bytes
                 for r in result:
                     if isinstance(r, bytes):
                         yield r
@@ -330,11 +369,12 @@ class application:
             result = build_result(result)
 
             status, headers = web.ctx.status, web.ctx.headers
-            start_resp(status, headers)
+            start_resp(status, headers)   # 调用 WSGI start_response 发送状态行和响应头
 
             def cleanup():
+                # 【设计层】cleanup 是生成器，挂在响应链末尾，确保响应体全部发送后执行清理
                 self._cleanup()
-                yield b""  # force this function to be a generator
+                yield b""  # 必须 yield 才是生成器，但实际不产生有效数据
 
             return itertools.chain(result, cleanup())
 
@@ -422,7 +462,14 @@ class application:
             return wsgiref.handlers.CGIHandler().run(wsgiapp)
 
     def load(self, env):
-        """Initializes ctx using env."""
+        """
+        【功能层】用 WSGI environ 字典初始化 web.ctx，建立当前请求的完整上下文。
+        【设计层】将 WSGI 的扁平化 environ 解析为语义化的 ctx 属性
+                （path、method、ip、protocol 等），屏蔽底层 WSGI 细节。
+                处理 lighttpd/nginx 的 PATH_INFO 编码差异（这两个服务器不自动 unquote）。
+        【上下文层】每次请求开始时由 wsgifunc 调用，ctx 的所有属性在此处被初始化，
+                后续所有处理器和视图函数都依赖这里设置的值。
+        """
         ctx = web.ctx
         ctx.clear()
         ctx.status = "200 OK"
@@ -477,10 +524,22 @@ class application:
         ctx.app_stack = []
 
     def _delegate(self, f, fvars, args=[]):
+        """
+        【功能层】将路由匹配结果（处理器 f）实例化并调用对应 HTTP 方法，返回响应。
+        【设计层】支持多种处理器形式：
+                 - None → 404
+                 - application 实例 → 子应用递归处理
+                 - 类（isclass）→ 实例化后调用 GET/POST 等方法
+                 - "redirect /url" 字符串 → 直接重定向
+                 - "module.ClassName" 字符串 → 动态导入并实例化
+                 - 可调用对象 → 直接调用
+                 这种多态分发替代了大量 if/isinstance 判断，体现鸭子类型思想。
+        """
         def handle_class(cls):
+            # 【功能层】实例化处理器类并调用对应 HTTP 方法（GET/POST/HEAD 等）
             meth = web.ctx.method
             if meth == "HEAD" and not hasattr(cls, meth):
-                meth = "GET"
+                meth = "GET"   # HEAD 无专用方法时降级为 GET
             if not hasattr(cls, meth):
                 raise web.nomethod(cls)
             tocall = getattr(cls(), meth)
@@ -513,6 +572,13 @@ class application:
             return web.notfound()
 
     def _match(self, mapping, value):
+        """
+        【功能层】遍历路由表，对 value（URL 路径或 host）进行正则匹配，
+                 返回 (处理器, 捕获分组列表) 或 (None, None)。
+        【设计层】路由模式被包裹为 `^pattern\Z`（\Z 匹配字符串末尾，比 $ 更严格），
+                 利用 re_subm 同时做替换和匹配，支持 "redirect /new" 形式的
+                 字符串处理器中使用反向引用（如 r"/foo/(.*)" → r"/bar/\1"）。
+        """
         for pat, what in mapping:
             if isinstance(what, application):
                 if value.startswith(pat):
@@ -569,6 +635,14 @@ class application:
 
 
 def with_metaclass(mcls):
+    """
+    【功能层】辅助函数：用指定元类 mcls 重新创建一个类，兼容 Python 2/3 的元类语法差异。
+    【设计层】Python 3 的元类语法是 `class Foo(Base, metaclass=Meta)`，
+             此函数提供一种通过装饰器指定元类的等价方式，保持代码整洁。
+             body.pop("__dict__") 是必要的清理步骤，否则复制的类字典中的
+             __dict__ 描述符会干扰新类的创建。
+    【上下文层】被 auto_application 用于创建带元类的 page 基类。
+    """
     def decorator(cls):
         body = vars(cls).copy()
         # clean out class body
@@ -580,7 +654,17 @@ def with_metaclass(mcls):
 
 
 class auto_application(application):
-    """Application similar to `application` but urls are constructed
+    """
+    【功能层】自动路由应用：继承 application，通过元类自动将子类注册为路由，
+             无需手动维护 URLs 元组。
+    【设计层】核心是内部类 metapage（继承 type）：每当用户定义 `class foo(app.page)`
+             时，metapage.__init__ 被调用，自动以类名（如 "/foo"）或 path 属性
+             注册路由——这是元类（metaclass）最典型的应用场景：
+             "在类定义时自动执行注册逻辑"。
+             with_metaclass 装饰器解决了 Python 2/3 元类语法兼容问题。
+    【上下文层】适合快速原型开发，用类定义代替显式路由配置，减少样板代码。
+
+    Application similar to `application` but urls are constructed
     automatically using metaclass.
 
         >>> app = auto_application()
@@ -665,6 +749,13 @@ class subdomain_application(application):
 
 def loadhook(h):
     """
+    【功能层】将一个"请求前"钩子函数 h 包装成符合处理器协议的函数。
+    【设计层】返回的 processor 接受 handler（下一步处理器）作为参数，
+             先调用 h()，再调用 handler()，实现"前置钩子"语义。
+             这是高阶函数（higher-order function）的典型应用。
+    【上下文层】application.__init__ 用此函数包装 _load（将 app 压栈）和
+             reload_mapping（热重载），以及 Reloader()（模块文件变更检测）。
+
     Converts a load hook into an application processor.
 
         >>> app = auto_application()
@@ -682,6 +773,13 @@ def loadhook(h):
 
 def unloadhook(h):
     """
+    【功能层】将一个"请求后"钩子函数 h 包装成处理器，无论请求是否抛出异常都会执行 h()。
+    【设计层】对生成器响应（流式输出）做了特殊处理：wrap() 是一个生成器，
+             它迭代原始结果，在迭代结束（StopIteration）时调用钩子，
+             确保即使响应是流式的，卸载钩子也在所有数据发送后才执行。
+             这类似 try/finally 的语义，但适配了生成器的惰性求值特性。
+    【上下文层】application.__init__ 用此函数包装 _unload（将 app 出栈）。
+
     Converts an unload hook into an application processor.
 
         >>> app = auto_application()
@@ -763,7 +861,16 @@ def autodelegate(prefix=""):
 
 
 class Reloader:
-    """Checks to see if any loaded modules have changed on disk and,
+    """
+    【功能层】文件变更检测器：检查所有已加载模块的源文件修改时间，
+             有变更则自动 reload，实现开发时热重载。
+    【设计层】通过记录各模块的 mtime（上次修改时间）与当前 mtime 对比，
+             利用 importlib.reload() 重新加载变更模块。
+             实现了 __call__ 协议，可作为 loadhook 的参数直接传递给处理器链。
+    【上下文层】debug 模式下由 application.__init__ 注册到 loadhook，
+             每次请求前触发检查，无需重启服务即可生效代码变更。
+
+    Checks to see if any loaded modules have changed on disk and,
     if so, reloads them.
     """
 

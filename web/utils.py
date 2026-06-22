@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-General Utilities
+General Utilities（通用工具集）
 (part of web.py)
+
+【功能层】提供 web.py 框架运行所需的基础工具：数据容器、函数缓存、字符串处理、
+         线程本地存储、邮件发送等。
+【设计层】大量使用 Python 高级特性：魔术方法重载、装饰器、元类、线程局部变量、
+         描述符协议等，体现了"小而美"的函数式 + 面向对象混合风格。
+【上下文层】被框架所有其他模块依赖，是 web.py 的基础设施层。
 """
 
 import datetime
@@ -73,6 +79,13 @@ __all__ = [
 
 class Storage(dict):
     """
+    【功能层】Storage 是增强型字典，同时支持属性访问（obj.foo）和下标访问（obj['foo']）。
+    【设计层】继承 dict 并重载 __getattr__ / __setattr__ / __delattr__ 三个魔术方法，
+             将属性操作代理到字典操作，是 Python "鸭子类型" 和描述符协议的经典应用。
+             相比 namedtuple 更灵活（可增删键），相比普通 dict 访问更简洁。
+    【上下文层】贯穿整个框架：web.ctx（请求上下文）、web.config（全局配置）、
+             数据库查询结果行、会话数据等都使用 Storage 或其子类。
+
     A Storage object is like a dictionary except `obj.foo` can be used
     in addition to `obj['foo']`.
 
@@ -93,29 +106,42 @@ class Storage(dict):
     """
 
     def __getattr__(self, key):
+        # 【功能层】属性访问时转为字典键查找；KeyError 转换成更友好的 AttributeError
+        # 【设计层】利用 Python 属性查找链：先找实例/类属性，找不到才调用 __getattr__
         try:
             return self[key]
         except KeyError as k:
             raise AttributeError(k)
 
     def __setattr__(self, key, value):
+        # 【功能层】属性赋值时同步写入字典，保持两种访问方式的一致性
         self[key] = value
 
     def __delattr__(self, key):
+        # 【功能层】属性删除时同步从字典中删除对应键
         try:
             del self[key]
         except KeyError as k:
             raise AttributeError(k)
 
     def __repr__(self):
+        # 【功能层】提供带类型标识的字符串表示，便于调试时区分 Storage 与普通 dict
         return "<Storage " + dict.__repr__(self) + ">"
 
 
-storage = Storage
+storage = Storage  # 小写别名，方便 `web.storage(a=1)` 的调用风格
 
 
 def storify(mapping, *requireds, **defaults):
     """
+    【功能层】从字典 mapping 创建 Storage 对象；requireds 是必须存在的键，
+             defaults 提供缺省值和类型提示。若 mapping 中的值是列表，
+             默认取最后一个元素（表单多值场景的合理默认）。
+    【设计层】利用可变参数 (*requireds, **defaults) 实现灵活的键声明，
+             结合 getattr(x, 'value', x) 自动解包表单字段对象（如 cgi.FieldStorage），
+             体现了"约定优于配置"的设计思想。
+    【上下文层】web.input() 内部调用此函数将原始 HTTP 参数字典转换为可属性访问的对象。
+
     Creates a `storage` object from dictionary `mapping`, raising `KeyError` if
     d doesn't have all of the keys in `requireds` and using the default
     values for keys found in `defaults`.
@@ -193,7 +219,13 @@ def storify(mapping, *requireds, **defaults):
 
 
 class Counter(storage):
-    """Keeps count of how many times something is added.
+    """
+    【功能层】计数器，记录每个键被 add() 添加的次数，并提供统计查询接口。
+    【设计层】继承 storage（即 Storage/dict），用字典存储计数，
+             是"组合优于继承"与"继承均可"场景下选用继承的简洁示范。
+    【上下文层】框架内部可用于统计请求、错误次数等；也作为工具类暴露给用户代码。
+
+    Keeps count of how many times something is added.
 
     >>> c = counter()
     >>> c.add('x')
@@ -373,6 +405,14 @@ safeunicode = safestr
 
 def timelimit(timeout):
     """
+    【功能层】装饰器工厂：为被装饰函数添加执行时间上限，超时抛出 RuntimeError。
+    【设计层】经典的"装饰器工厂"三层嵌套结构：timelimit(n) -> _1(func) -> _2(*args)。
+             内部用 threading.Thread 在独立线程运行目标函数，主线程调用 join(timeout)
+             等待；若线程仍存活则判定超时。
+             注意：线程无法被强制终止，超时后目标函数仍在后台执行（文档中有说明）。
+    【上下文层】web.py 使用此装饰器保护可能因外部依赖（DB、网络）而卡死的操作；
+             同时作为 memoize 的后台刷新控制手段。
+
     A decorator to limit a function to `timeout` seconds, raising `TimeoutError`
     if it takes longer.
 
@@ -395,28 +435,32 @@ def timelimit(timeout):
     """
 
     def _1(function):
+        # 【设计层】第二层闭包，捕获 function，返回真正的包装函数 _2
         def _2(*args, **kw):
+            # 【设计层】第三层闭包，每次调用时创建独立的 Dispatch 线程
             class Dispatch(threading.Thread):
+                # 【设计层】内部类线程，daemon=True 保证主进程退出时不被此线程阻塞
                 def __init__(self):
                     threading.Thread.__init__(self)
-                    self.result = None
-                    self.error = None
+                    self.result = None   # 保存函数正常返回值
+                    self.error = None    # 保存函数抛出的异常信息
 
-                    self.daemon = True
-                    self.start()
+                    self.daemon = True   # 守护线程：主线程结束时自动回收
+                    self.start()         # 构造时即启动，减少一次显式调用
 
                 def run(self):
+                    # 【功能层】在新线程中执行目标函数，捕获所有异常以便主线程重新抛出
                     try:
                         self.result = function(*args, **kw)
                     except:
-                        self.error = sys.exc_info()
+                        self.error = sys.exc_info()  # (type, value, traceback) 三元组
 
             c = Dispatch()
-            c.join(timeout)
+            c.join(timeout)          # 主线程最多等待 timeout 秒
             if c.is_alive():
-                raise RuntimeError("took too long")
+                raise RuntimeError("took too long")   # 超时：线程仍在运行
             if c.error:
-                raise c.error[1]
+                raise c.error[1]     # 把子线程的异常在主线程重新抛出
             return c.result
 
         return _2
@@ -426,6 +470,16 @@ def timelimit(timeout):
 
 class Memoize:
     """
+    【功能层】函数结果缓存（记忆化）：对相同参数的调用直接返回缓存结果，避免重复计算。
+             支持过期时间（expires 秒后重新计算）和后台刷新（background=True 时
+             在独立线程更新缓存，调用方立即得到旧值，不阻塞）。
+    【设计层】实现了 __call__ 协议，使实例可以像函数一样调用（可调用对象模式）。
+             用 threading.Lock 保证缓存写入的线程安全；后台刷新时使用非阻塞 acquire
+             避免多线程同时触发刷新。缓存 key 为 (args, tuple(kwargs.items()))，
+             要求参数必须可哈希。
+    【上下文层】`re_compile = memoize(re.compile)` 是框架内最典型的用例：
+             缓存编译好的正则对象，大幅减少重复编译开销。
+
     'Memoizes' a function, caching its return values for each input.
     If `expires` is specified, values are recalculated after `expires` seconds.
     If `background` is specified, values are recalculated in a separate thread.
@@ -485,12 +539,17 @@ class Memoize:
         self.running_lock = threading.Lock()
 
     def __call__(self, *args, **keywords):
+        # 【功能层】每次调用时，先构建缓存键，检查是否命中缓存
         key = (args, tuple(keywords.items()))
+        # 【设计层】用 running_lock 保护 running 字典本身的创建，
+        #          running[key] 是针对单个缓存槽的更新锁
         with self.running_lock:
             if not self.running.get(key):
                 self.running[key] = threading.Lock()
 
         def update(block=False):
+            # 【功能层】执行原始函数并更新缓存；block=True 时阻塞等待锁（初次计算），
+            #          block=False 时尝试获取锁（后台刷新，获取不到则放弃此次更新）
             if self.running[key].acquire(block):
                 try:
                     self.cache[key] = (self.func(*args, **keywords), time.time())
@@ -498,20 +557,24 @@ class Memoize:
                     self.running[key].release()
 
         if key not in self.cache:
-            update(block=True)
+            update(block=True)    # 首次调用：同步阻塞计算
         elif self.expires and (time.time() - self.cache[key][1]) > self.expires:
             if self.background:
-                threading.Thread(target=update).start()
+                threading.Thread(target=update).start()  # 后台刷新，不阻塞调用方
             else:
-                update()
-        return self.cache[key][0]
+                update()          # 同步刷新
+        return self.cache[key][0]  # 返回缓存值（tuple 第 0 项）
 
 
-memoize = Memoize
+memoize = Memoize  # 小写别名
 
+# 【功能层】缓存版的正则编译函数；相同 pattern 只编译一次
+# 【设计层】memoize(re.compile) 是函数式编程中"高阶函数"的典型应用：
+#          把一个普通函数包装成带缓存能力的新函数，完全无需修改原函数
 re_compile = memoize(re.compile)
 re_compile.__doc__ = """
 A memoized version of re.compile.
+（记忆化正则编译：对相同 pattern 的 re.compile 调用只执行一次，结果复用）
 """
 
 
@@ -542,6 +605,12 @@ def re_subm(pat, repl, string):
 
 def group(seq, size):
     """
+    【功能层】将序列按固定大小分组，返回生成器（惰性求值）。
+    【设计层】使用生成器表达式（generator expression），比返回列表更节省内存；
+             切片操作 seq[i:i+size] 自然处理尾部不足 size 的情况。
+    【上下文层】application.init_mapping 用此函数将 (url_pattern, handler, ...) 
+             的平铺元组转为 [(pattern, handler), ...] 的路由表。
+
     Returns an iterator over a series of lists of length size from iterable.
 
         >>> list(group([1,2,3,4], 2))
@@ -1244,6 +1313,16 @@ def tryall(context, prefix=None):
 
 class ThreadedDict(threadlocal):
     """
+    【功能层】线程本地存储容器，不同线程通过同一个 ThreadedDict 实例访问各自独立的数据。
+    【设计层】继承 threading.local，Python 的线程本地变量原生机制；
+             同时实现完整的 dict 接口（__getitem__、__setitem__ 等），
+             让线程本地数据能像字典一样操作。
+             _instances 类变量使用 set 追踪所有实例，支持 clear_all() 批量清理，
+             是"注册表模式"（Registry Pattern）的简单应用。
+    【上下文层】web.ctx（请求上下文）的底层存储即为 ThreadedDict 实例。
+             每个请求在独立线程（或协程）中处理，ctx 的读写互不干扰，
+             这是 web.py 实现线程安全请求隔离的核心机制。
+
     Thread local storage.
 
         >>> d = ThreadedDict()
@@ -1260,23 +1339,25 @@ class ThreadedDict(threadlocal):
         1
     """
 
-    _instances = set()
+    _instances = set()  # 类级注册表，追踪所有 ThreadedDict 实例，用于 clear_all
 
     def __init__(self):
-        ThreadedDict._instances.add(self)
+        ThreadedDict._instances.add(self)  # 创建时注册自身
 
     def __del__(self):
-        ThreadedDict._instances.remove(self)
+        ThreadedDict._instances.remove(self)  # 销毁时注销，防止内存泄漏
 
     def __hash__(self):
-        return id(self)
+        return id(self)  # 使实例可放入 set，以对象地址为哈希值
 
     def clear_all():
-        """Clears all ThreadedDict instances."""
+        """【功能层】清除所有 ThreadedDict 实例中当前线程的数据。
+        【上下文层】application._cleanup() 在每次请求结束后调用此方法，
+                  防止线程复用时上一请求的数据污染下一请求。"""
         for t in list(ThreadedDict._instances):
             t.clear()
 
-    clear_all = staticmethod(clear_all)
+    clear_all = staticmethod(clear_all)  # 定义为静态方法，无需实例即可调用
 
     # Define all these methods to more or less fully emulate dict -- attribute access
     # is built into threading.local.

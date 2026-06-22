@@ -1,6 +1,13 @@
 """
-HTTP Utilities
+HTTP Utilities（HTTP 工具函数集）
 (from web.py)
+
+【功能层】提供 HTTP 缓存控制（Expires/Last-Modified/ETag）、URL 构建与修改、
+         性能分析输出等工具函数。
+【设计层】所有函数依赖 web.ctx 读取请求上下文，体现了"隐式上下文"设计——
+         调用方无需显式传递请求对象，框架通过线程本地变量自动提供。
+【上下文层】应用开发者在视图函数中调用，如 `web.expires(3600)` 设置缓存，
+         `web.url('/path', key='val')` 构建带参数 URL。
 """
 
 __all__ = [
@@ -52,6 +59,14 @@ def lastmodified(date_obj):
 
 def modified(date=None, etag=None):
     """
+    【功能层】HTTP 缓存协商：检查客户端缓存是否仍然有效，若有效则抛出 304 Not Modified，
+             避免重复传输未变化的内容。
+    【设计层】同时支持 Last-Modified（时间戳）和 ETag（版本令牌）两种缓存验证机制，
+             任一匹配即视为缓存有效。时间比较时减去 1 秒是因为 HTTP 日期精度只到秒级。
+             用"抛出异常"而非"返回布尔值"来终止请求，保持与 HTTPError 体系一致。
+    【上下文层】视图函数中使用：`if web.modified(date=last_change): ...`，
+             配合 expires() 和 lastmodified() 构建完整的 HTTP 缓存策略。
+
     Checks to see if the page has been modified since the version in the
     requester's cache.
 
@@ -112,6 +127,13 @@ def urlencode(query, doseq=0):
 
 def changequery(query=None, **kw):
     """
+    【功能层】在保留当前 URL 其他查询参数的基础上，修改/删除指定参数，返回新 URL。
+    【设计层】先读取当前所有 GET 参数（rawinput），再用 **kw 覆盖或删除（value=None）
+             指定键，最后重新编码。此模式避免了手工解析 URL 的繁琐，
+             是"不可变更新"（immutable update）风格在 URL 操作上的应用。
+    【上下文层】用于分页、排序、筛选等场景：`web.changequery(page=2)` 在当前 URL
+             基础上只改变 page 参数，其他参数自动保留。
+
     Imagine you're at `/foo?a=1&b=2`. Then `changequery(a=3)` will return
     `/foo?a=3&b=2` -- the same URL but with the arguments you requested
     changed.

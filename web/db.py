@@ -1,6 +1,15 @@
 """
-Database API
+Database API（数据库抽象层）
 (part of web.py)
+
+【功能层】提供统一的数据库操作接口，支持 SQLite、MySQL、PostgreSQL，
+         屏蔽不同数据库驱动的参数化查询风格差异（qmark/?、format/%s、pyformat/%(k)s）。
+【设计层】SQLQuery/SQLParam 实现类型安全的 SQL 构建，从根本上防止 SQL 注入；
+         DB 类用 threadeddict 管理数据库连接，每个线程独立连接，线程安全；
+         事务用上下文管理器（Transaction.__enter__/__exit__）封装，
+         支持 `with db.transaction():` 语法，是 Python 上下文管理器协议的典型应用。
+【上下文层】用户通过 `db = web.database(dbn='sqlite', db='test.db')` 获取 DB 实例，
+         然后调用 db.select、db.insert、db.update、db.delete 等进行操作。
 """
 
 import ast
@@ -81,6 +90,15 @@ class UnknownParamstyle(Exception):
 
 class SQLParam:
     """
+    【功能层】SQL 参数占位符包装器，将 Python 值标记为"需要参数化传递"的安全参数，
+             而非直接拼接到 SQL 字符串中。
+    【设计层】__slots__ 限制只有 value 属性，节省内存；
+             get_marker() 根据数据库驱动的 paramstyle 返回对应占位符（%s、?、:1 等），
+             实现跨数据库的参数化查询抽象。
+             这是"值对象"（Value Object）模式：不可变、由值决定相等性。
+    【上下文层】所有 db.select/insert 等方法最终都将用户参数包装为 SQLParam，
+             再组装成 SQLQuery，彻底消除 SQL 注入风险。
+
     Parameter in SQLQuery.
 
         >>> q = SQLQuery(["SELECT * FROM test WHERE name=", SQLParam("joe")])
@@ -130,6 +148,15 @@ sqlparam = SQLParam
 
 class SQLQuery:
     """
+    【功能层】类型安全的 SQL 查询对象，由字符串片段和 SQLParam 参数列表组成，
+             支持 + 拼接操作，最终通过 query()/values() 分离出 SQL 模板和参数列表。
+    【设计层】items 列表存储 str 和 SQLParam 的混合序列，
+             query() 用占位符替换 SQLParam，values() 提取所有参数值，
+             两者搭配传给数据库驱动的 cursor.execute(sql, params)，
+             由数据库驱动完成转义，从底层杜绝 SQL 注入。
+             重载 __add__/__radd__/__iadd__ 支持自然的字符串拼接风格。
+    【上下文层】reparam()、sqlquote() 等函数的返回类型，DB 类执行时最终消费此对象。
+
     You can pass this sort of thing as a clause in any db function.
     Otherwise, you can pass a dictionary to the keyword argument `vars`
     and the function will call reparam for you.
@@ -629,7 +656,16 @@ class Transaction:
 
 
 class DB:
-    """Database"""
+    """
+    【功能层】数据库操作核心类，封装底层数据库驱动，提供 select/insert/update/delete
+             等高层方法，支持参数化查询、事务管理和连接池。
+    【设计层】用 threadeddict（_ctx）实现线程本地的数据库连接，每个线程有独立连接，
+             避免多线程共享连接导致的竞态条件；ctx 通过 property 延迟初始化，
+             首次访问时才建立连接（懒加载模式）。
+             可选集成 DBUtils 连接池，通过 pooling 参数控制。
+    【上下文层】由 database() 工厂函数创建具体子类实例（SqliteDB、MySqlDB 等），
+             用户无需直接实例化 DB。
+    """
 
     def __init__(self, db_module, keywords):
         """Creates a database."""

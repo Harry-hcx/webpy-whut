@@ -1,6 +1,15 @@
 """
-Web API (wrapper around WSGI)
+Web API（WSGI 上层封装）
 (from web.py)
+
+【功能层】向用户代码暴露 HTTP 语义：读取请求输入、设置响应头/Cookie、
+         抛出 HTTP 状态码异常、访问请求上下文 ctx。
+【设计层】用异常（HTTPError 及其子类）来表达 HTTP 响应状态，
+         利用 threadeddict 实现每请求独立的上下文对象（ctx），
+         动态创建 HTTP 状态码类（_status_code 工厂函数），
+         体现了 Python 元编程与异常控制流的惯用法。
+【上下文层】是 web.py 对外 API 的核心层，应用开发者几乎所有操作
+         都通过此模块的函数完成，被所有其他模块依赖。
 """
 
 import pprint
@@ -73,6 +82,12 @@ __all__ = [
 
 config = storage()
 config.__doc__ = """
+【功能层】全局配置对象，控制框架运行时行为（调试模式、数据库连接、邮件服务器等）。
+【设计层】使用 Storage 实例作为配置载体，既可 config.debug 也可 config['debug']，
+         比 dict 更直观，比 dataclass 更灵活（运行时可任意增加键）。
+【上下文层】各模块通过 `from .webapi import config` 共享同一全局配置实例；
+         用户代码在启动时设置 web.config.debug = True 等即可改变框架行为。
+
 A configuration object for various aspects of web.py.
 
 `debug`
@@ -81,26 +96,44 @@ A configuration object for various aspects of web.py.
 
 
 class HTTPError(Exception):
+    """
+    【功能层】所有 HTTP 响应异常的基类。抛出此异常即可终止正常处理流程，
+             直接向客户端返回对应的 HTTP 状态码和响应体。
+    【设计层】用异常（而非返回值）表达 HTTP 响应，是 web.py 的核心设计选择。
+             好处：可在任意调用深度（模板、辅助函数内）直接终止请求，
+             无需逐层传递返回值。本质是"以异常为控制流"的编程范式。
+    【上下文层】application.wsgifunc 中的 except web.HTTPError as e 捕获所有子类，
+             统一转换为 WSGI 响应，是框架请求处理管道的终止点。
+    """
     def __init__(self, status, headers={}, data=""):
-        ctx.status = status
+        ctx.status = status             # 写入请求上下文的状态码（如 "404 Not Found"）
         for k, v in headers.items():
-            header(k, v)
-        self.data = data
+            header(k, v)               # 逐个添加响应头到 ctx.headers
+        self.data = data               # 响应体内容
         Exception.__init__(self, status)
 
 
 def _status_code(status, data=None, classname=None, docstring=None):
+    """
+    【功能层】HTTP 状态码类的动态工厂函数，根据状态码字符串（如 "200 OK"）
+             在运行时动态创建对应的异常类（如 OK、Created 等）。
+    【设计层】使用 type(name, bases, dict) 元类调用动态创建类——这是 Python
+             元编程最基础的形式，避免了为每个状态码手写重复的类定义。
+             每个生成的类都继承 HTTPError，可被 except HTTPError 统一捕获。
+    【上下文层】模块级别调用此函数批量生成 ok/OK、created/Created 等别名，
+             让用户可以 `raise web.NotFound()` 或 `return web.ok()` 两种风格混用。
+    """
     if data is None:
-        data = status.split(" ", 1)[1]
+        data = status.split(" ", 1)[1]    # 从 "404 Not Found" 提取 "Not Found" 作为默认响应体
     classname = status.split(" ", 1)[1].replace(
         " ", ""
-    )  # 304 Not Modified -> NotModified
+    )  # "304 Not Modified" -> "NotModified"（类名不含空格）
     docstring = docstring or "`%s` status" % status
 
     def __init__(self, data=data, headers={}):
         HTTPError.__init__(self, status, headers, data)
 
-    # trick to create class dynamically with dynamic docstring.
+    # 【设计层】type() 三参数调用：type(类名, 基类元组, 属性字典) 动态创建类
     return type(
         classname, (HTTPError, object), {"__doc__": docstring, "__init__": __init__}
     )
@@ -384,6 +417,14 @@ internalerror = InternalError
 
 def header(hdr, value, unique=False):
     """
+    【功能层】向当前请求的响应头列表中追加一条响应头。
+    【设计层】unique=True 时先遍历现有头，同名则跳过，防止重复；
+             响应头以列表形式存储（支持同名多值，如 Set-Cookie），
+             而非字典（字典同名键会覆盖）。同时做换行符注入检测，
+             防御 HTTP 响应拆分攻击（Response Splitting Attack）。
+    【上下文层】写入 ctx.headers，最终由 application.wsgifunc 中的
+             start_response(status, headers) 传给 WSGI 服务器。
+
     Adds the header `hdr: value` with the response.
 
     If `unique` is True and a header with that name already exists,
@@ -455,6 +496,14 @@ def rawinput(method=None):
 
 def input(*requireds, **defaults):
     """
+    【功能层】返回包含当前请求 GET/POST 参数的 Storage 对象，
+             支持声明必填字段（requireds）和默认值（defaults）。
+    【设计层】先调用 rawinput() 获取原始参数字典，再用 storify() 转换为
+             可属性访问的 Storage；若缺少必填字段自动返回 400 BadRequest。
+             _method 参数允许只读取 GET 或 POST 参数子集。
+    【上下文层】应用开发者最常用的 API 之一：`data = web.input(name="default")`，
+             内部依赖 rawinput、storify 和 multipart 库完成解析。
+
     Returns a `storage` object with the GET and POST arguments.
     See `storify` for how `requireds` and `defaults` work.
     """
@@ -607,6 +656,13 @@ def _debugwrite(x):
 debug.write = _debugwrite
 
 ctx = context = threadeddict()
+# 【功能层】ctx 是每个请求的上下文对象，存储请求的所有相关信息（path、method、env 等）
+#          和响应的状态（status、headers、output）。
+# 【设计层】threadeddict() 即 ThreadedDict 实例，利用 threading.local 实现线程隔离：
+#          不同线程（请求）读写各自的 ctx 互不干扰，无需加锁。
+#          同时提供 `context` 作为别名，两者指向同一对象。
+# 【上下文层】框架所有组件（application.load、webapi 各函数、session 等）都通过
+#          `web.ctx` 读写请求状态，它是贯穿整个请求生命周期的"全局请求状态容器"。
 
 ctx.__doc__ = """
 A `storage` object containing various information about the request:
